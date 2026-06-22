@@ -100,7 +100,21 @@ def upload_warehouse(warehouse: str, products_dict: dict):
 def read_warehouse(warehouse: str) -> dict:
     data = get_db_root().child("products").child(warehouse).child("products").get()
     return data or {}
+    
+def backup_warehouse_bytes(warehouse: str) -> bytes:
+    """Ακριβές JSON αντίγραφο της τρέχουσας αποθήκης (για επαναφορά 1:1)."""
+    data = read_warehouse(warehouse)
+    payload = {
+        "warehouse": warehouse,
+        "backup_at": datetime.datetime.now().isoformat(),
+        "products": data,
+    }
+    return json.dumps(payload, ensure_ascii=False, indent=2).encode("utf-8")
 
+
+def restore_warehouse(warehouse: str, products_dict: dict):
+    """Επαναφορά αποθήκης από backup JSON."""
+    upload_warehouse(warehouse, products_dict)
 
 def warehouse_kind(name: str) -> str:
     if name in RETALIA_WAREHOUSES:
@@ -351,19 +365,28 @@ def _color_cases(ws):
 
 
 def _color_retalia(ws):
-    """Πράσινο=νέο, μπλε=Βρέθηκε, κόκκινο=ΟΧΙ· κίτρινο στο κελί ΝΕΑ_ΔΙΑΣΤΑΣΗ όπου υπάρχει."""
     i_new = _idx(ws, "ΝΕΟ")
     i_status = _idx(ws, "ΚΑΤΑΣΤΑΣΗ")
-    i_newdim = _idx(ws, "ΝΕΑ_ΔΙΑΣΤΑΣΗ")
+    i_corr = _idx(ws, "ΔΙΟΡΘΩΘΗΚΕ")
     for r in ws.iter_rows(min_row=2):
+        has_correction = i_corr is not None and str(r[i_corr].value or "").strip() == "ΝΑΙ"
         is_new = i_new is not None and str(r[i_new].value or "").strip() == "ΝΑΙ"
         status = (r[i_status].value if i_status is not None else "") or ""
-        row_fill = GREEN if is_new else (BLUE if status == "Βρέθηκε" else (RED if status == "ΟΧΙ" else None))
+
+        if has_correction:
+            row_fill = YELLOW
+        elif is_new:
+            row_fill = GREEN
+        elif status == "Βρέθηκε":
+            row_fill = BLUE
+        elif status == "ΟΧΙ":
+            row_fill = RED
+        else:
+            row_fill = None
+
         if row_fill:
             for c in r:
                 c.fill = row_fill
-        if i_newdim is not None and r[i_newdim].value not in (None, ""):
-            r[i_newdim].fill = YELLOW   # ξεχωρίζει η αλλαγμένη διάσταση
 
 
 def _single_sheet(df: pd.DataFrame, sheet_name: str, color_fn=None) -> bytes:
@@ -519,6 +542,7 @@ def export_retalia(warehouse: str) -> bytes:
                 "ΠΡΟΜΗΘΕΥΤΗΣ": rdata.get("προμηθευτής", ""),
                 "ΔΙΑΣΤΑΣΗ": rdata.get("διάσταση", ""),
                 "ΝΕΑ_ΔΙΑΣΤΑΣΗ": rdata.get("νέα_διάσταση", ""),
+                "ΔΙΟΡΘΩΘΗΚΕ": "ΝΑΙ" if (str(rdata.get("νέα_διάσταση", "")).strip() != "" or rdata.get("διορθωμένο") is True) else "",
                 "ΚΑΤΑΣΤΑΣΗ": rdata.get("κατάσταση", ""),
                 "ΝΕΟ": "ΝΑΙ" if rdata.get("νέο") is True else "",
             }
@@ -647,14 +671,55 @@ def app_view():
                     if warnings:
                         confirmed = st.checkbox("Ναι, είμαι σίγουρος — ανέβασέ το παρά τις προειδοποιήσεις.")
 
+                    # --- BACKUP πριν το upload (ΑΣΠΙΔΑ) ---
+                    st.divider()
+                    st.markdown("**🛟 Backup πριν το upload**")
+                    if st.button("📥 Φτιάξε backup τρέχουσας αποθήκης", use_container_width=True):
+                        try:
+                            st.session_state.backup_bytes = backup_warehouse_bytes(warehouse)
+                            st.session_state.backup_for = warehouse
+                        except Exception as e:
+                            st.error(f"Αποτυχία backup: {e}")
+
+                    backup_ready = (st.session_state.get("backup_for") == warehouse
+                                    and st.session_state.get("backup_bytes"))
+                    if backup_ready:
+                        st.download_button(
+                            "💾 Κατέβασε το backup (JSON)",
+                            data=st.session_state.backup_bytes,
+                            file_name=f"BACKUP_{warehouse}_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.json",
+                            mime="application/json",
+                            use_container_width=True,
+                        )
+
+                    backup_done = st.checkbox("✅ Έχω κατεβάσει το backup")
+
                     st.warning("Το Upload ΑΝΤΙΚΑΘΙΣΤΑ τα δεδομένα της αποθήκης στη Firebase.")
                     if st.button("📡 Upload στη Firebase", type="primary",
-                                 use_container_width=True, disabled=not confirmed):
+                                 use_container_width=True,
+                                 disabled=not (confirmed and backup_done)):
                         try:
                             upload_warehouse(warehouse, built)
                             st.success(f"Ανέβηκαν στην αποθήκη '{warehouse}'.")
                         except Exception as e:
                             st.error(f"Αποτυχία upload: {e}")
+
+            # --- ΕΠΑΝΑΦΟΡΑ από backup ---
+            st.divider()
+            st.markdown("**♻️ Επαναφορά από backup**")
+            st.caption("Ανέβασε ένα backup JSON για να επαναφέρεις την αποθήκη όπως ήταν.")
+            restore_file = st.file_uploader("Backup JSON", type=["json"], key=f"restore_{warehouse}")
+            if st.button("♻️ Επαναφορά αποθήκης", use_container_width=True):
+                if not restore_file:
+                    st.warning("Διάλεξε πρώτα ένα backup JSON.")
+                else:
+                    try:
+                        payload = json.load(restore_file)
+                        products = payload.get("products", payload)
+                        restore_warehouse(warehouse, products)
+                        st.success(f"Επαναφέρθηκε η αποθήκη '{warehouse}'.")
+                    except Exception as e:
+                        st.error(f"Αποτυχία επαναφοράς: {e}")
 
 
 def _do_export(fn, filename):
