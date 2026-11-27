@@ -9,6 +9,10 @@
         - "διάσταση" = αρχική, "νέα_διάσταση" = διορθωμένη, "νέο"=true για app-added
 """
 
+import copy
+import hashlib
+import threading
+import uuid
 import io
 import json
 import datetime
@@ -353,49 +357,56 @@ def row_status(r: dict) -> str:
     return str(r.get("s") or "open")
 
 
+class _TxAbort(Exception):
+    """Ακύρωση transaction χωρίς ΚΑΜΙΑ εγγραφή (το firebase_admin δεν δέχεται None)."""
+    def __init__(self, result=None):
+        super().__init__("abort")
+        self.result = result
+
+
+def _run_tx(ref, fn):
+    """Τρέχει transaction. Επιστρέφει (True, None) αν γράφτηκε, (False, αποτέλεσμα) αν ακυρώθηκε."""
+    try:
+        ref.transaction(fn)
+        return True, None
+    except _TxAbort as a:
+        return False, a.result
+
+
 def acquire_web_lock(warehouse, location, code, name, force=False):
     """Όπως το acquireDiffLock της εφαρμογής. Επιστρέφει:
        ("locked", None)   -> πήραμε το κίτρινο
        ("checked", None)  -> ήδη πράσινο/μωβ: δεν κλειδώνουμε (ίδιο με εφαρμογή)
        ("busy", όνομα)    -> το ελέγχει άλλος τώρα (φρέσκο) — ζητάμε επιβεβαίωση
        ("missing", None)  -> δεν υπάρχει στο index"""
-    result = {}
-
     def tx(cur):
         if not isinstance(cur, dict):
-            result["r"] = ("missing", None)
-            return cur
+            raise _TxAbort(("missing", None))
         s, by, at = cur.get("s", "open"), cur.get("by"), cur.get("at") or 0
         if s == "checked" or cur.get("v") is True:
-            result["r"] = ("checked", None)
-            return cur
+            raise _TxAbort(("checked", None))
         fresh = (now_ms() - int(at)) < APP_LOCK_FRESH_MS
         if s == "checking" and by and by != name and fresh and not force:
-            result["r"] = ("busy", by)
-            return cur
+            raise _TxAbort(("busy", by))
         new = dict(cur)
         new.update({"s": "checking", "by": name, "at": now_ms(), "w": name})
-        result["r"] = ("locked", None)
         return new
 
-    _row_ref(warehouse, location, code).transaction(tx)
-    return result.get("r", ("missing", None))
+    wrote, res = _run_tx(_row_ref(warehouse, location, code), tx)
+    return ("locked", None) if wrote else res
 
 
 def heartbeat_web_lock(warehouse, location, code, name) -> bool:
     """Κρατά «ζωντανό» το δικό μας κίτρινο. False αν το πήρε άλλος / έκλεισε."""
-    ok = {}
-
     def tx(cur):
         if isinstance(cur, dict) and cur.get("s") == "checking" and cur.get("by") == name \
                 and cur.get("w") == name:
-            new = dict(cur); new["at"] = now_ms(); ok["v"] = True
+            new = dict(cur); new["at"] = now_ms()
             return new
-        ok["v"] = False
-        return cur
+        raise _TxAbort(False)
 
-    _row_ref(warehouse, location, code).transaction(tx)
-    return ok.get("v", False)
+    wrote, _ = _run_tx(_row_ref(warehouse, location, code), tx)
+    return wrote
 
 
 def release_web_lock(warehouse, location, code, name=None, only_if_stale=False):
@@ -403,15 +414,15 @@ def release_web_lock(warehouse, location, code, name=None, only_if_stale=False):
     def tx(cur):
         if not (isinstance(cur, dict) and cur.get("s") == "checking" and cur.get("w")
                 and cur.get("w") == cur.get("by")):
-            return cur
+            raise _TxAbort()
         if name is not None and cur.get("by") != name:
-            return cur
+            raise _TxAbort()
         if only_if_stale and (now_ms() - int(cur.get("at") or 0)) < WEB_LOCK_STALE_MS:
-            return cur
+            raise _TxAbort()
         new = dict(cur); new["s"] = "open"; new.pop("w", None)
         return new
 
-    _row_ref(warehouse, location, code).transaction(tx)
+    _run_tx(_row_ref(warehouse, location, code), tx)
 
 
 def read_product(warehouse, code) -> dict:
@@ -437,6 +448,17 @@ def refresh_index_numbers(warehouse, location, code, product=None):
     return tm - ti, tm
 
 
+class _BinChanged(RuntimeError):
+    pass
+
+
+class PartialSave(RuntimeError):
+    """Η αποθήκευση ΞΕΚΙΝΗΣΕ να γράφει και σταμάτησε: done = όσα γράφτηκαν σίγουρα."""
+    def __init__(self, msg, done, failed_bin):
+        super().__init__(msg)
+        self.done, self.failed_bin = done, failed_bin
+
+
 def save_bin_corrections(warehouse, location, code, name, edits: list) -> list:
     """edits: [{bin, loaded_total, new_total (ή None), comment}]
     Για κάθε bin γράφει ΜΙΑ νέα μέτρηση (όπως η εφαρμογή) με ποσότητα = νέο − τωρινό,
@@ -453,24 +475,40 @@ def save_bin_corrections(warehouse, location, code, name, edits: list) -> list:
 
     done = []
     for e in edits:
-        bref = _bin_ref(warehouse, code, location, e["bin"])
-        loaded = float(e["loaded_total"])
-        qty = 0.0 if e.get("new_total") is None else float(e["new_total"]) - loaded
-        t = now_local()
-        m_key = f"{name}_{t.strftime('%Y%m%d-%H%M%S')}-{t.microsecond // 1000:03d}"
-        measurement = {
-            "user": name,
-            "timestamp": t.strftime("%d-%H:%M:%S"),
-            "ποσότητα": qty,
-            "ραφι": "",
-            "σχόλιο": (e.get("comment") or "").strip(),
-        }
-        mref = bref.child("μετρήσεις").child(m_key)
-        mref.set(measurement)
-        if mref.get() is None:   # επιβεβαίωση όπως safeSetWithVerification της εφαρμογής
-            raise RuntimeError(f"Η μέτρηση στο bin '{e['bin']}' δεν επιβεβαιώθηκε. Δοκίμασε ξανά.")
-        if qty != 0:
-            bref.child("συνολική_μέτρηση").transaction(lambda cur, q=qty: float(cur or 0) + q)
+        try:
+            bref = _bin_ref(warehouse, code, location, e["bin"])
+            loaded = float(e["loaded_total"])
+            qty = 0.0 if e.get("new_total") is None else float(e["new_total"]) - loaded
+            t = now_local()
+            m_key = f"{name}_{t.strftime('%Y%m%d-%H%M%S')}-{t.microsecond // 1000:03d}"
+            measurement = {
+                "user": name,
+                "timestamp": t.strftime("%d-%H:%M:%S"),
+                "ποσότητα": qty,
+                "ραφι": "",
+                "σχόλιο": (e.get("comment") or "").strip(),
+            }
+            mref = bref.child("μετρήσεις").child(m_key)
+            mref.set(measurement)
+            if mref.get() is None:   # επιβεβαίωση όπως safeSetWithVerification της εφαρμογής
+                raise RuntimeError(f"Η μέτρηση στο bin '{e['bin']}' δεν επιβεβαιώθηκε.")
+            if qty != 0:
+                def _tx(cur, q=qty, base=loaded, b=e["bin"]):
+                    c = float(cur or 0)
+                    if abs(c - base) > 1e-9:      # κάποιος άλλος έγραψε στο μεταξύ -> ΚΑΜΙΑ αλλαγή
+                        raise _BinChanged(f"Το bin '{b}' άλλαξε στο μεταξύ (ήταν {fmt_num(base)}, "
+                                          f"τώρα {fmt_num(c)}). Πάτα «🔄 Ξαναφόρτωσε».")
+                    return c + q
+                try:
+                    bref.child("συνολική_μέτρηση").transaction(_tx)
+                except _BinChanged:
+                    try:
+                        mref.delete()        # το σύνολο ΔΕΝ άλλαξε -> αναίρεση της μέτρησης που μόλις γράψαμε
+                    except Exception:
+                        pass
+                    raise
+        except Exception as ex:
+            raise PartialSave(str(ex), done, e["bin"]) from ex
         done.append((e["bin"], qty))
     return done
 
@@ -503,6 +541,77 @@ def mark_checked_web(warehouse, location, code, name, d, m):
         return "verified"
     ref.update({"s": "checked", "by": name, "at": now_ms(), "d": d, "m": m, "w": None})
     return "checked"
+
+
+def _as_dict(v) -> dict:
+    """Το Firebase μπορεί να επιστρέψει λίστα αντί για dict (αριθμητικά κλειδιά)."""
+    if isinstance(v, dict):
+        return v
+    if isinstance(v, list):
+        return {str(i): x for i, x in enumerate(v) if x is not None}
+    return {}
+
+
+def build_diff_index(warehouse: str) -> int:
+    """ΑΚΡΙΒΕΣ αντίγραφο του DiffIndexBuilder της εφαρμογής:
+    - διαβάζει όλη την αποθήκη ΜΙΑ φορά, για ΟΛΕΣ τις τοποθεσίες
+    - d = μέτρηση − αρχικό (σύνολο bins), m = μέτρηση, desc = περιγραφή
+    - κρατά πράσινα (s/by/at) και μωβ (v/vby/vat)· τα κίτρινα γίνονται «open»
+    - όπου διαφορά 0 σβήνει την παλιά γραμμή
+    - ΕΝΑ ατομικό write στο τέλος· ΔΕΝ αγγίζει ποτέ το /products."""
+    root = get_db_root()
+    existing = _as_dict(root.child("diff_index").child(warehouse).get())
+    products = _as_dict(root.child("products").child(warehouse).child("products").get())
+    updates, count = {}, 0
+    for barcode, p in products.items():
+        p = _as_dict(p)
+        desc = p.get("ΠΕΡΙΓΡΑΦΗ")
+        desc = "" if desc is None else str(desc)
+        for loc_key, loc in _as_dict(p.get("locations")).items():
+            ti = tm = 0.0
+            for b in _as_dict(_as_dict(loc).get("bins")).values():
+                b = _as_dict(b)
+                ti += float(b.get("αρχικό_απόθεμα", 0) or 0)
+                tm += float(b.get("συνολική_μέτρηση", 0) or 0)
+            diff = tm - ti
+            base = f"diff_index/{warehouse}/{loc_key}/{barcode}"
+            if diff != 0.0:
+                updates[f"{base}/d"] = diff
+                updates[f"{base}/m"] = tm
+                updates[f"{base}/desc"] = desc
+                prev = _as_dict(_as_dict(existing.get(loc_key)).get(barcode))
+                if prev.get("s") == "checked":
+                    updates[f"{base}/s"] = "checked"
+                    if prev.get("by") is not None:
+                        updates[f"{base}/by"] = prev["by"]
+                    if isinstance(prev.get("at"), (int, float)):
+                        updates[f"{base}/at"] = int(prev["at"])
+                else:
+                    updates[f"{base}/s"] = "open"
+                if prev.get("v") is True:
+                    updates[f"{base}/v"] = True
+                    if prev.get("vby") is not None:
+                        updates[f"{base}/vby"] = prev["vby"]
+                    if isinstance(prev.get("vat"), (int, float)):
+                        updates[f"{base}/vat"] = int(prev["vat"])
+                count += 1
+            else:
+                updates[base] = None
+    # Όσο κατέβαινε η αποθήκη μπορεί κάποιος να άλλαξε γραμμές (πράσινο/μωβ/διόρθωση):
+    # τις αφήνουμε ΑΚΡΙΒΩΣ όπως τις άφησε εκείνος.
+    fresh = _as_dict(root.child("diff_index").child(warehouse).get())
+    touched = set()
+    for loc_key in set(existing) | set(fresh):
+        a, b = _as_dict(existing.get(loc_key)), _as_dict(fresh.get(loc_key))
+        for bc in set(a) | set(b):
+            if a.get(bc) != b.get(bc):
+                touched.add(f"diff_index/{warehouse}/{loc_key}/{bc}")
+    if touched:
+        updates = {k: v for k, v in updates.items()
+                   if not any(k == t or k.startswith(t + "/") for t in touched)}
+    if updates:
+        root.update(updates)
+    return count
 
 
 def fmt_num(v) -> str:
@@ -910,7 +1019,17 @@ def export_cases(warehouse: str) -> bytes:
 
     if not rows:
         return b""
-    return _single_sheet(pd.DataFrame(rows), "Cases", _color_cases)
+    df = pd.DataFrame(rows)
+    # Σημειώσεις / «Δεν μετράμε» από το γραφείο: στήλες στο ΤΕΛΟΣ, μόνο αν υπάρχουν
+    # (χωρίς σημειώσεις το export μένει ακριβώς όπως πριν).
+    notes = [_case_notes_text(c) if isinstance(c, dict) else "" for c in data.values()]
+    excl = [_case_excl_text(c) if isinstance(c, dict) else "" for c in data.values()]
+    notes = [n for n, c in zip(notes, data.values()) if isinstance(c, dict)]
+    excl = [e for e, c in zip(excl, data.values()) if isinstance(c, dict)]
+    if any(notes) or any(excl):
+        df["ΣΗΜΕΙΩΣΕΙΣ"] = notes
+        df["ΔΕΝ ΜΕΤΡΑΜΕ"] = excl
+    return _single_sheet(df, "Cases", _color_cases)
 
 
 def export_retalia(warehouse: str) -> bytes:
@@ -1223,16 +1342,469 @@ def _close_open_code(warehouse):
     load_diff_rows.clear()
 
 
+# ============================================================
+# LIVE ΚΙΒΩΤΙΑ — ΜΟΝΟ ΑΝΑΓΝΩΣΗ (δεν γράφει τίποτα στη βάση)
+# Λογική εφαρμογής (BoxWarehouseActivity):
+#   - από Excel: κατάσταση "ΟΧΙ", φύλλα ""          -> αναμένεται
+#   - σκανάρισμα υπάρχοντος: κατάσταση "Βρέθηκε", "Θέση", μέτρηση {user, timestamp, location, position}
+#   - σκανάρισμα ΑΓΝΩΣΤΟΥ: νέο κιβώτιο με "φύλλα" (υποχρεωτικό) και "Θεση" -> δεν ήταν στη λίστα
+# ============================================================
+CASES_LIVE_WAREHOUSES = [w for w, k in WAREHOUSES.items() if k == "cases" and w not in RETALIA_WAREHOUSES]
+CASE_CATS = {
+    "missing": ("🔴 Δεν βρέθηκαν", "#FFCDD2"),
+    "new":     ("🟢 Βρέθηκαν ενώ δεν ήταν στη λίστα", "#C8E6C9"),
+    "found":   ("🔵 Βρέθηκαν κανονικά", "#BBDEFB"),
+    "other":   ("⚪ Άλλη κατάσταση", "#EEEEEE"),
+}
+CASE_COLS = ["ΚΑΤΗΓΟΡΙΑ", "CASE", "ΠΕΡΙΓΡΑΦΗ", "ΔΙΑΣΤΑΣΗ", "ΑΝΑΜ. ΤΟΠΟΘΕΣΙΑ", "ΒΡΕΘΗΚΕ ΣΕ", "ΘΕΣΗ",
+             "ΣΗΜΕΙΩΣΕΙΣ", "ΔΕΝ ΜΕΤΡΑΜΕ", "ΑΠΟ", "ΩΡΑ", "ΦΥΛΛΑ", "ΣΕ ΑΛΛΗ ΤΟΠΟΘΕΣΙΑ", "ΚΩΔΙΚΟΣ"]
+CASE_OPTIONAL_COLS = ["ΣΗΜΕΙΩΣΕΙΣ", "ΔΕΝ ΜΕΤΡΑΜΕ", "ΣΕ ΑΛΛΗ ΤΟΠΟΘΕΣΙΑ"]   # κρύβονται αν είναι όλες κενές
+EXCLUDED_COLOR = "#E0E0E0"
+CASE_DATA_COLS = ["CASE", "ΚΩΔΙΚΟΣ", "ΠΕΡΙΓΡΑΦΗ", "ΔΙΑΣΤΑΣΗ", "ΦΥΛΛΑ", "ΑΝΑΜ. ΤΟΠΟΘΕΣΙΑ", "ΒΡΕΘΗΚΕ ΣΕ", "ΘΕΣΗ"]
+
+
+def _case_notes(c: dict) -> list:
+    """Σημειώσεις γραφείου, χρονολογικά."""
+    ns = [n for n in _as_dict((c or {}).get("σημειώσεις")).values() if isinstance(n, dict)]
+    return sorted(ns, key=lambda n: (int(n.get("at") or 0) if str(n.get("at") or "0").isdigit() else 0))
+
+
+def _case_notes_text(c: dict) -> str:
+    return " || ".join(f"{_txt(n.get('user'))} {_txt(n.get('timestamp'))}: {_txt(n.get('κείμενο'))}"
+                       for n in _case_notes(c))
+
+
+def _case_excl_text(c: dict) -> str:
+    e = (c or {}).get("εξαίρεση")
+    if not isinstance(e, dict):
+        return ""
+    return f"🚫 {_txt(e.get('by'))}" + (f": {_txt(e.get('λόγος'))}" if _txt(e.get("λόγος")) else "")
+
+
+def _case_ref(warehouse, serial):
+    return get_db_root().child("products").child(warehouse).child("products").child(serial)
+
+
+def _note_entry(name, text, t=None):
+    t = t or now_local()
+    key = f"{name}_{t.strftime('%Y%m%d-%H%M%S')}-{t.microsecond // 1000:03d}-{uuid.uuid4().hex[:6]}"
+    return key, {"user": name, "timestamp": t.strftime("%d/%m %H:%M"), "at": now_ms(), "κείμενο": text}
+
+
+def _case_tx(warehouse, serial, change):
+    """Ατομική αλλαγή ΕΝΟΣ κιβωτίου (transaction σε όλο τον κόμβο του).
+    Αν το κιβώτιο δεν υπάρχει -> 'missing' και ΔΕΝ δημιουργείται τίποτα."""
+    res = {}
+
+    def tx(cur):
+        if not isinstance(cur, dict):
+            raise _TxAbort("missing")
+        new = copy.deepcopy(cur)
+        r = change(new)
+        if r == "already":
+            raise _TxAbort("already")
+        res["r"] = r
+        return new
+
+    wrote, aborted = _run_tx(_case_ref(warehouse, serial), tx)
+    return res.get("r", "ok") if wrote else aborted
+
+
+def add_case_note(warehouse, serial, name, text) -> str:
+    text = (text or "").strip()
+    if not text:
+        raise ValueError("Γράψε κάτι στη σημείωση.")
+    key, note = _note_entry(name, text)
+
+    def ch(c):
+        notes = c.get("σημειώσεις")
+        c["σημειώσεις"] = dict(notes) if isinstance(notes, dict) else _as_dict(notes)
+        c["σημειώσεις"][key] = note
+        return "ok"
+
+    if _case_tx(warehouse, serial, ch) == "missing":
+        raise RuntimeError(f"Το κιβώτιο {serial} δεν υπάρχει (ίσως ξαναφορτώθηκε η αποθήκη).")
+    return key
+
+
+def set_case_exclusion(warehouse, serial, name, excluded: bool, reason: str = "") -> str:
+    reason = (reason or "").strip()
+    key, note = _note_entry(name, ("🚫 Δεν μετράμε" + (f": {reason}" if reason else "")) if excluded
+                            else "↩️ Μετράμε ξανά")
+
+    def ch(c):
+        if excluded == isinstance(c.get("εξαίρεση"), dict):
+            return "already"          # ήδη έτσι (διπλό κλικ / άλλος χρήστης) -> καμία αλλαγή
+        if excluded:
+            c["εξαίρεση"] = {"by": name, "at": now_ms(), "λόγος": reason}
+        else:
+            c.pop("εξαίρεση", None)
+        notes = c.get("σημειώσεις")
+        c["σημειώσεις"] = dict(notes) if isinstance(notes, dict) else _as_dict(notes)
+        c["σημειώσεις"][key] = note
+        return "ok"
+
+    r = _case_tx(warehouse, serial, ch)
+    if r == "missing":
+        raise RuntimeError(f"Το κιβώτιο {serial} δεν υπάρχει (ίσως ξαναφορτώθηκε η αποθήκη).")
+    return r
+
+
+def mark_case_found_web(warehouse, serial, name, location, position, comment="") -> str:
+    """Όπως το σκανάρισμα της εφαρμογής (BoxWarehouseActivity): ΜΟΝΟ αν είναι ακόμα «ΟΧΙ» ->
+    μέτρηση {user, timestamp, location, position} + κατάσταση «Βρέθηκε» + «Θέση».
+    Όλα μαζί ατομικά. Επιστρέφει 'found' | 'already' | 'missing'."""
+    position = (position or "").strip()
+    if not position:
+        raise ValueError("Γράψε τη θέση (όπως ζητά και η εφαρμογή).")
+    t = now_local()
+    m_key = f"{name}_{t.strftime('%d-%H:%M:%S')}-web{t.microsecond // 1000:03d}{uuid.uuid4().hex[:4]}"
+    meas = {"user": name, "timestamp": t.strftime("%d-%H:%M:%S"), "location": location,
+            "position": position, "σχόλιο": (comment or "").strip() or "από γραφείο"}
+
+    def ch(c):
+        raw = c.get("κατάσταση")
+        if ("ΟΧΙ" if raw is None else str(raw)).strip() != "ΟΧΙ":
+            return "already"
+        ms = c.get("μετρήσεις")
+        c["μετρήσεις"] = dict(ms) if isinstance(ms, dict) else _as_dict(ms)
+        c["μετρήσεις"][m_key] = meas
+        c["κατάσταση"] = "Βρέθηκε"
+        c["Θέση"] = position
+        return "found"
+
+    return _case_tx(warehouse, serial, ch)
+
+
+@st.cache_data(ttl=LIVE_REFRESH_SEC - 5, show_spinner=False)
+def load_cases(warehouse: str) -> dict:
+    """ΚΟΙΝΗ cache για όλους: η αποθήκη διαβάζεται το πολύ μία φορά ανά ~20''."""
+    return _as_dict(read_warehouse(warehouse))
+
+
+def _txt(v) -> str:
+    return "" if v is None else str(v).strip()
+
+
+def case_rows(data: dict) -> list:
+    """Κιβώτια -> γραμμές με κατηγορία. Ίδια σειρά προτεραιότητας με τα χρώματα του export:
+    φύλλα (νέο) -> Βρέθηκε -> ΟΧΙ. Χωρίς κατάσταση = "ΟΧΙ" (όπως η εφαρμογή)."""
+    rows = []
+    for serial, c in _as_dict(data).items():
+        if not isinstance(c, dict):
+            continue
+        raw_st = c.get("κατάσταση")                # όπως η εφαρμογή: ΜΟΝΟ το null σημαίνει «ΟΧΙ»
+        status = "ΟΧΙ" if raw_st is None else (str(raw_st).strip() or "(κενή)")
+        leaves = c.get("φύλλα")
+        is_new = leaves not in (None, "", "null")
+        if is_new:
+            cat = "new"
+        elif status == "Βρέθηκε":
+            cat = "found"
+        elif status == "ΟΧΙ":
+            cat = "missing"
+        else:
+            cat = "other"
+        ms = [m for m in _as_dict(c.get("μετρήσεις")).values() if isinstance(m, dict)]
+        found_locs = sorted({_txt(m.get("location")) for m in ms if _txt(m.get("location"))})
+        users = sorted({_txt(m.get("user")) for m in ms if _txt(m.get("user"))})
+        times = sorted({_txt(m.get("timestamp")) for m in ms if _txt(m.get("timestamp"))})
+        pos = _txt(c.get("Θέση")) or _txt(c.get("Θεση")) or \
+            next((_txt(m.get("position")) for m in ms if _txt(m.get("position"))), "")
+        exp_loc = _txt(c.get("τοποθεσια"))
+        other_loc = (cat == "found" and bool(exp_loc) and bool(found_locs)
+                     and exp_loc.upper() not in {l.upper() for l in found_locs})
+        notes = _case_notes(c)
+        last_note = notes[-1] if notes else None
+        rows.append({
+            "_cat": cat, "_excl": isinstance(c.get("εξαίρεση"), dict), "_status": status,
+            "_loc_keys": [exp_loc] if exp_loc else found_locs,
+            "ΣΗΜΕΙΩΣΕΙΣ": (f"{_txt(last_note.get('user'))}: {_txt(last_note.get('κείμενο'))}"
+                           + (f"  (+{len(notes) - 1})" if len(notes) > 1 else "")) if last_note else "",
+            "ΔΕΝ ΜΕΤΡΑΜΕ": _case_excl_text(c),
+            "ΚΑΤΗΓΟΡΙΑ": CASE_CATS[cat][0] + (f" ({status})" if cat == "other" else ""),
+            "CASE": str(serial), "ΚΩΔΙΚΟΣ": _txt(c.get("ΚΩΔΙΚΟΣ")), "ΠΕΡΙΓΡΑΦΗ": _txt(c.get("ΠΕΡΙΓΡΑΦΗ")),
+            "ΔΙΑΣΤΑΣΗ": _txt(c.get("διάσταση")), "ΦΥΛΛΑ": _txt(leaves) if is_new else "",
+            "ΑΝΑΜ. ΤΟΠΟΘΕΣΙΑ": exp_loc, "ΒΡΕΘΗΚΕ ΣΕ": ", ".join(found_locs), "ΘΕΣΗ": pos,
+            "ΑΠΟ": ", ".join(users), "ΩΡΑ": ", ".join(times), "ΣΕ ΑΛΛΗ ΤΟΠΟΘΕΣΙΑ": "⚠️ ΝΑΙ" if other_loc else "",
+        })
+    rows.sort(key=lambda r: r["CASE"])
+    return rows
+
+
+def filter_case_rows(rows, cats, only_other_loc=False, locs=None, search="", hide_desc=None, hide_terms="",
+                     show_excluded=False):
+    """Φίλτρα προβολής (ΔΕΝ αλλάζουν τίποτα στη βάση). Τα «δεν μετράμε» κρύβονται εκτός αν ζητηθούν."""
+    search = (search or "").strip().lower()
+    terms = [t.strip().lower() for t in (hide_terms or "").split(",") if t.strip()]
+    hide_desc = set(hide_desc or [])
+    out = []
+    for r in rows:
+        if r.get("_excl") and not show_excluded:
+            continue
+        if cats and r["_cat"] not in cats:
+            continue
+        if only_other_loc and not r["ΣΕ ΑΛΛΗ ΤΟΠΟΘΕΣΙΑ"]:
+            continue
+        if locs and not (set(r.get("_loc_keys") or [r["ΑΝΑΜ. ΤΟΠΟΘΕΣΙΑ"]]) & set(locs)):
+            continue
+        if r["ΠΕΡΙΓΡΑΦΗ"] in hide_desc:
+            continue
+        hay = " ".join(str(r[c]) for c in CASE_COLS).lower()
+        if search and search not in hay:
+            continue
+        if terms:
+            data_hay = " ".join(str(r.get(c, "")) for c in CASE_DATA_COLS).lower()
+            if any(t in data_hay for t in terms):
+                continue
+        out.append(r)
+    return out
+
+
+def cases_view(warehouse: str, role: str = "USER"):
+    can_edit = role == "ADMIN" or bool(user_password())
+    st.caption("Τα φίλτρα είναι για τον καθένα ξεχωριστά. Σημειώσεις / «Βρέθηκε» / «Δεν μετράμε» "
+               "γράφονται στη βάση, τα βλέπουν όλοι και βγαίνουν στο export.")
+    fl = st.session_state.pop("cases_flash", None)
+    if fl:
+        st.success(fl)
+    if can_edit:
+        with st.expander("✏️ Σημείωση / αλλαγή σε κιβώτιο",
+                         expanded=bool(st.session_state.get("cases_pick"))
+                         or st.session_state.get(f"ca_{warehouse}_case", "—") != "—"):
+            try:
+                _case_actions(warehouse)
+            except Exception as e:
+                st.warning(f"Δεν φορτώθηκαν τα κιβώτια ({e}). Δοκίμασε ξανά σε λίγο.")
+    else:
+        st.info("Προβολή μόνο: για σημειώσεις/αλλαγές χρειάζεται κωδικός USER στα Secrets.")
+    _cases_live(warehouse)
+
+
+def _case_actions(warehouse: str):
+    k = f"ca_{warehouse}_"
+    data = load_cases(warehouse)
+    pick = st.session_state.pop("cases_pick", None)
+    if pick and pick in _as_dict(data):
+        st.session_state[k + "case"] = pick       # πριν σχεδιαστεί το selectbox (επιτρέπεται)
+    names = team_names()
+    cur_name = st.session_state.get("live_name")
+    c1, c2 = st.columns([1, 3])
+    with c1:
+        name = st.selectbox("Ποιος είσαι;", ["—"] + names,
+                            index=(names.index(cur_name) + 1) if cur_name in names else 0, key=k + "name")
+        if name != "—":
+            st.session_state.live_name = name
+    rows = {r["CASE"]: r for r in case_rows(data)}
+    with c2:
+        serial = st.selectbox("Κιβώτιο (γράψε για αναζήτηση)", ["—"] + list(rows),
+                              format_func=lambda s: s if s == "—" or s not in rows else
+                              f"{s} — {rows[s]['ΠΕΡΙΓΡΑΦΗ']} — {rows[s]['ΚΑΤΗΓΟΡΙΑ']}"
+                              + (" — 🚫" if rows[s]["_excl"] else ""),
+                              key=k + "case")
+    if name == "—":
+        st.info("Διάλεξε πρώτα το όνομά σου — μπαίνει σε κάθε σημείωση/αλλαγή.")
+        return
+    if serial == "—" or serial not in rows:
+        return
+    try:
+        fresh = _case_ref(warehouse, serial).get()      # ζωντανά από τη βάση, όχι από την cache
+    except Exception:
+        fresh = data.get(serial)
+    if not isinstance(fresh, dict):
+        st.warning(f"Το κιβώτιο {serial} δεν υπάρχει πια στη βάση (ίσως ξαναφορτώθηκε η αποθήκη).")
+        return
+    c = fresh
+    r = case_rows({serial: c})[0]
+    st.markdown(f"**{serial}** · {r['ΠΕΡΙΓΡΑΦΗ']} · {r['ΔΙΑΣΤΑΣΗ']} · {r['ΚΑΤΗΓΟΡΙΑ']}"
+                + (f" · θέση **{r['ΘΕΣΗ']}**" if r["ΘΕΣΗ"] else "")
+                + (f" · αναμ. τοποθεσία {r['ΑΝΑΜ. ΤΟΠΟΘΕΣΙΑ']}" if r["ΑΝΑΜ. ΤΟΠΟΘΕΣΙΑ"] else ""))
+    notes = _case_notes(c)
+    if notes:
+        st.dataframe(pd.DataFrame([{"ΑΠΟ": _txt(n.get("user")), "ΩΡΑ": _txt(n.get("timestamp")),
+                                    "ΣΗΜΕΙΩΣΗ": _txt(n.get("κείμενο"))} for n in notes]),
+                     hide_index=True, use_container_width=True)
+
+    def done(msg):
+        load_cases.clear()
+        st.session_state.cases_flash = msg
+        st.rerun()
+
+    a1, a2, a3 = st.columns(3)
+    with a1:
+        with st.form(k + "note_f", clear_on_submit=True):
+            txt = st.text_area("📝 Νέα σημείωση", height=80)
+            if st.form_submit_button("Προσθήκη σημείωσης", use_container_width=True):
+                try:
+                    add_case_note(warehouse, serial, name, txt)
+                except Exception as e:
+                    st.error(f"Δεν αποθηκεύτηκε: {e}")
+                else:
+                    done(f"📝 Σημείωση στο {serial} αποθηκεύτηκε.")
+    with a2:
+        if r["_cat"] == "missing":
+            with st.form(k + "found_f", clear_on_submit=True):
+                st.markdown("✅ **Βρέθηκε** (όπως το σκανάρισμα)")
+                exp = r["ΑΝΑΜ. ΤΟΠΟΘΕΣΙΑ"]
+                loc = st.selectbox("Τοποθεσία", LOCATIONS,
+                                   index=LOCATIONS.index(exp) if exp in LOCATIONS else 0)
+                pos = st.text_input("Θέση (υποχρεωτικό)")
+                com = st.text_input("Σχόλιο (προαιρετικό)")
+                if st.form_submit_button("✅ Σήμανση «Βρέθηκε»", use_container_width=True):
+                    res = None
+                    try:
+                        res = mark_case_found_web(warehouse, serial, name, loc, pos, com)
+                    except Exception as e:
+                        st.error(f"Δεν αποθηκεύτηκε: {e}")
+                    if res == "found":
+                        done(f"✅ {serial}: Βρέθηκε (θέση {pos.strip()}).")
+                    elif res == "already":
+                        load_cases.clear()
+                        st.warning("Το κιβώτιο έχει ΗΔΗ βρεθεί (μάλλον μόλις από την εφαρμογή). Δεν άλλαξε τίποτα.")
+                    elif res == "missing":
+                        st.error("Το κιβώτιο δεν υπάρχει πια στη βάση.")
+        else:
+            st.caption("✅ «Βρέθηκε» γίνεται μόνο σε κιβώτια που δεν έχουν βρεθεί.")
+    with a3:
+        with st.form(k + "excl_f", clear_on_submit=True):
+            if r["_excl"]:
+                st.markdown(f"🚫 **Δεν μετράμε** — {r['ΔΕΝ ΜΕΤΡΑΜΕ'].replace('🚫 ', '', 1)}")
+                if st.form_submit_button("↩️ Μετράμε ξανά", use_container_width=True):
+                    try:
+                        rr = set_case_exclusion(warehouse, serial, name, False)
+                    except Exception as e:
+                        st.error(f"Δεν αποθηκεύτηκε: {e}")
+                    else:
+                        done(f"↩️ {serial}: μετράμε ξανά." if rr != "already"
+                             else f"{serial}: ήταν ήδη «μετράμε» — καμία αλλαγή.")
+            else:
+                reason = st.text_input("🚫 Δεν μετράμε — λόγος")
+                if st.form_submit_button("🚫 Δεν το μετράμε", use_container_width=True):
+                    try:
+                        rr = set_case_exclusion(warehouse, serial, name, True, reason)
+                    except Exception as e:
+                        st.error(f"Δεν αποθηκεύτηκε: {e}")
+                    else:
+                        done(f"🚫 {serial}: δεν μετράμε." if rr != "already"
+                             else f"{serial}: ήταν ήδη «δεν μετράμε» (από άλλον) — καμία αλλαγή.")
+
+
+@st.fragment(run_every=LIVE_REFRESH_SEC)
+def _cases_live(warehouse: str):
+    try:
+        rows = case_rows(load_cases(warehouse))
+    except Exception as e:
+        st.warning(f"Δεν φορτώθηκαν τα κιβώτια ({e}). Νέα προσπάθεια σε ~{LIVE_REFRESH_SEC}''.")
+        return
+    if not rows:
+        st.info("Η αποθήκη κιβωτίων είναι άδεια.")
+        return
+    act = [r for r in rows if not r["_excl"]]
+    cnt = {k: sum(1 for r in act if r["_cat"] == k) for k in CASE_CATS}
+    n_other_loc = sum(1 for r in act if r["ΣΕ ΑΛΛΗ ΤΟΠΟΘΕΣΙΑ"])
+    n_excl = len(rows) - len(act)
+    m = st.columns(6)
+    m[0].metric("Σύνολο", len(rows))
+    m[1].metric("🔴 Δεν βρέθηκαν", cnt["missing"])
+    m[2].metric("🟢 Εκτός λίστας", cnt["new"])
+    m[3].metric("🔵 Βρέθηκαν", cnt["found"])
+    m[4].metric("⚠️ Σε άλλη τοποθεσία", n_other_loc)
+    m[5].metric("🚫 Δεν μετράμε", n_excl)
+    st.caption(f"Ενημέρωση κάθε ~{LIVE_REFRESH_SEC}'' · τελευταία: {now_local().strftime('%H:%M:%S')}"
+               + (f" · ⚪ άλλη κατάσταση: {cnt['other']}" if cnt["other"] else ""))
+
+    k = f"cs_{warehouse}_"
+    cat_keys = [c for c in CASE_CATS if c != "other" or cnt["other"]]
+    f1, f2 = st.columns([3, 2])
+    with f1:
+        cats = st.multiselect("Εμφάνιση", cat_keys, default=["missing", "new"],
+                              format_func=lambda c: CASE_CATS[c][0], key=k + "cats", placeholder="Όλα",
+                              help="Άδειο = όλα.")
+    with f2:
+        all_locs = sorted({l for r in rows for l in r["_loc_keys"] if l})
+        locs = st.multiselect("Τοποθεσία", all_locs, key=k + "locs",
+                              help="Η αναμενόμενη τοποθεσία· για όσα ήταν εκτός λίστας, εκεί που βρέθηκαν. "
+                                   "Άδειο = όλες.",
+                              placeholder="Όλες")
+    g1, g2 = st.columns([3, 2])
+    with g1:
+        search = st.text_input("🔎 Αναζήτηση (case, κωδικός, περιγραφή, διάσταση, θέση, χρήστης…)", key=k + "q")
+    with g2:
+        only_other = st.checkbox("Μόνο όσα βρέθηκαν σε άλλη τοποθεσία", key=k + "oth")
+        show_excl = st.checkbox(f"Δείξε και τα «δεν μετράμε» ({n_excl})", key=k + "exc")
+    with st.expander("🚫 Απόκρυψη κιβωτίων που δεν θα μετρηθούν"):
+        all_desc = sorted({r["ΠΕΡΙΓΡΑΦΗ"] for r in rows if r["ΠΕΡΙΓΡΑΦΗ"]})
+        hide_desc = st.multiselect("Κρύψε αυτές τις περιγραφές", all_desc, key=k + "hd",
+                                   placeholder="Διάλεξε περιγραφές…")
+        hide_terms = st.text_input("Κρύψε όσα περιέχουν (χώρισε με κόμμα, π.χ. GUARDIAN, 3210x2250)",
+                                   key=k + "ht")
+
+    shown = filter_case_rows(rows, cats, only_other, locs, search, hide_desc, hide_terms, show_excl)
+    st.write(f"Εμφανίζονται: **{len(shown)}** / {len(rows)}")
+    if not shown:
+        return
+    df = pd.DataFrame(shown)
+    colors = [EXCLUDED_COLOR if x else CASE_CATS[c][1] for c, x in zip(df["_cat"], df["_excl"])]
+    df = df[CASE_COLS]
+    df = df.drop(columns=[c for c in CASE_OPTIONAL_COLS if not any(r[c] for r in shown)])
+    styled = df.style.apply(lambda col: [f"background-color: {c}; color: #000" for c in colors], axis=0)
+    clicked, tbl_key = _table_click(f"cs_tbl_{warehouse}", [r["CASE"] for r in shown])
+    if clicked:
+        st.session_state.cases_pick = clicked
+        st.rerun()
+    st.caption("👆 Κάνε κλικ σε ένα κιβώτιο για σημείωση / αλλαγή (ανοίγει από πάνω).")
+    st.dataframe(styled, hide_index=True, use_container_width=True, height=680, key=tbl_key,
+                 on_select="rerun", selection_mode=["single-row", "single-cell"])
+    try:
+        out = io.BytesIO()
+        df.to_excel(out, index=False, sheet_name="Κιβώτια")
+        st.download_button("📥 Κατέβασε αυτό που βλέπεις (Excel)", out.getvalue(),
+                           file_name=f"kivotia_{now_local().strftime('%Y%m%d_%H%M')}.xlsx",
+                           mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                           key=k + "dl")
+    except Exception as e:
+        st.caption(f"(Excel μη διαθέσιμο: {e})")
+
+
 def live_view(warehouse: str, role: str):
     st.subheader("📋 Live Διαφορές")
+    _oc = st.session_state.get("live_open")
+    if _oc and _oc.get("wh") != warehouse:
+        _close_open_code(_oc.get("wh"))       # άλλαξε αποθήκη -> ελευθερώνουμε το κίτρινο
+    if warehouse in CASES_LIVE_WAREHOUSES:
+        cases_view(warehouse, role)
+        return
     if warehouse not in bins_warehouses():
-        st.info("Οι live διαφορές υπάρχουν μόνο για αποθήκες τύπου bins.")
+        st.info("Οι live διαφορές υπάρχουν για αποθήκες τύπου bins και για την αποθήκη κιβωτίων.")
         return
 
     can_edit = role == "ADMIN" or bool(user_password())
     if not can_edit:
         st.warning("Προβολή μόνο: για να γίνονται διορθώσεις από εδώ, ο admin πρέπει να βάλει "
                    "κωδικό USER (`[user] password` στα Secrets).")
+
+    if role == "ADMIN":
+        bf = st.session_state.pop("build_flash", None)
+        if bf:
+            st.success(bf)
+        bn = st.session_state.get("build_n", 0)
+        with st.expander("🛠 Χτίσιμο index διαφορών (admin)"):
+            st.caption(f"Όπως το κουμπί «Χτίσιμο index» της εφαρμογής: διαβάζει ΟΛΗ την αποθήκη "
+                       f"**{warehouse}** μία φορά και ξαναφτιάχνει τη λίστα διαφορών για όλες τις "
+                       "τοποθεσίες. Τα πράσινα/μωβ κρατιούνται, τα κίτρινα γίνονται λευκά. "
+                       "Οι μετρήσεις ΔΕΝ αγγίζονται.")
+            sure_b = st.checkbox("Ναι, θέλω να ξαναχτιστεί", key=f"build_sure_{warehouse}_{bn}")
+            if st.button("🔧 Χτίσιμο index", disabled=not sure_b, key=f"build_btn_{warehouse}_{bn}"):
+                try:
+                    with st.spinner("Χτίσιμο…"):
+                        n = build_diff_index(warehouse)
+                    st.session_state.pop("live_open", None)
+                    load_diff_rows.clear()
+                    st.session_state.build_n = bn + 1          # ξε-τσεκάρει το «Ναι»
+                    st.session_state.build_flash = f"Index έτοιμο: {n} διαφορές ({warehouse})"
+                    st.rerun()
+                except Exception as e:
+                    st.error(f"Σφάλμα στο χτίσιμο: {e}")
 
     c1, c2 = st.columns(2)
     with c1:
@@ -1258,21 +1830,32 @@ def live_view(warehouse: str, role: str):
     lf = st.session_state.pop("live_list_flash", None)
     if lf:
         st.success(lf)
-    _live_list(warehouse, location, name)
+    sb = st.session_state.pop("live_switch_block", None)
+    if sb:
+        st.warning(sb)
+    # Ανοιχτός κωδικός -> ΠΡΩΤΑ ο πίνακας του (να φαίνεται αμέσως), από κάτω η λίστα.
     if st.session_state.get("live_open"):
+        with st.container(border=True):
+            _live_detail(warehouse, location, name, can_edit)
         st.divider()
-        _live_detail(warehouse, location, name, can_edit)
+    _live_list(warehouse, location, name)
 
 
 @st.fragment(run_every=LIVE_REFRESH_SEC)
 def _live_list(warehouse, location, name):
-    rows = load_diff_rows(warehouse, location)
+    try:
+        rows = _as_dict(load_diff_rows(warehouse, location))
+    except Exception as e:
+        st.warning(f"Δεν φορτώθηκε η λίστα ({e}). Νέα προσπάθεια σε ~{LIVE_REFRESH_SEC}''.")
+        return
     oc = st.session_state.get("live_open")
 
     # Συντήρηση κλειδωμάτων: κρατάμε ζωντανό το δικό μας, ελευθερώνουμε εγκαταλελειμμένα web.
     try:
-        if oc and oc.get("locked"):
-            heartbeat_web_lock(warehouse, location, oc["code"], name)
+        if oc and oc.get("locked") and oc.get("wh") == warehouse and oc.get("loc") == location:
+            if not heartbeat_web_lock(warehouse, location, oc["code"], name):
+                # Το κίτρινο χάθηκε (έληξε/το πήρε άλλος) -> στο επόμενο βήμα ξαναελέγχεται ζωντανά.
+                oc.update({"locked": False, "lock_checked": False, "force": False})
         for code, r in rows.items():
             if isinstance(r, dict) and r.get("s") == "checking" and r.get("w") \
                     and r.get("w") == r.get("by") and not (oc and oc["code"] == code):
@@ -1305,7 +1888,8 @@ def _live_list(warehouse, location, name):
              and (not q or q in x["ΚΩΔΙΚΟΣ"].lower() or q in str(x["ΠΕΡΙΓΡΑΦΗ"]).lower())]
     st.write(f"Διαφορές: **{len(shown)}** / {len(data)}")
     if not data:
-        st.info("Δεν υπάρχει index διαφορών για αυτή την τοποθεσία. Ο admin το χτίζει από την εφαρμογή.")
+        st.info("Δεν υπάρχει index διαφορών για αυτή την τοποθεσία. Ο admin το χτίζει από την εφαρμογή "
+                "ή από εδώ (🛠 Χτίσιμο index).")
         return
 
     df = pd.DataFrame(shown or [], columns=["ΚΩΔΙΚΟΣ", "ΠΕΡΙΓΡΑΦΗ", "ΔΙΑΦΟΡΑ", "ΜΕΤΡΗΣΗ", "ΚΑΤΑΣΤΑΣΗ", "_s"])
@@ -1313,21 +1897,177 @@ def _live_list(warehouse, location, name):
     styled = (df.drop(columns=["_s"]).style
               .apply(lambda col: [f"background-color: {c}; color: #000" for c in colors], axis=0)
               .format({"ΔΙΑΦΟΡΑ": fmt_num, "ΜΕΤΡΗΣΗ": fmt_num}))
-    st.dataframe(styled, hide_index=True, use_container_width=True, height=380)
+    # Κλικ σε γραμμή -> ανοίγει ο κωδικός. Ο κωδικός βρίσκεται από τη λίστα που ΕΙΔΕ ο χρήστης
+    # (αποθηκευμένη στο προηγούμενο σχέδιο), όχι από τη φρέσκια, ώστε να μην ανοίξει λάθος κωδικός
+    # αν στο μεταξύ άλλαξε η λίστα. Το κλείδωμα ελέγχεται ζωντανά στη βάση τη στιγμή του ανοίγματος.
+    clicked, tbl_key = _table_click(f"live_tbl_{warehouse}_{location}", [x["ΚΩΔΙΚΟΣ"] for x in shown])
+    if clicked:
+        _open_live_code(warehouse, location, clicked, name)
+    st.caption("👆 Κάνε κλικ σε έναν κωδικό για να τον ανοίξεις.")
+    st.dataframe(styled, hide_index=True, use_container_width=True, height=680, key=tbl_key,
+                 on_select="rerun", selection_mode=["single-row", "single-cell"])
 
     opts = [x["ΚΩΔΙΚΟΣ"] for x in shown]
     labels = {x["ΚΩΔΙΚΟΣ"]: f"{x['ΚΩΔΙΚΟΣ']} — {x['ΠΕΡΙΓΡΑΦΗ']}" for x in shown}
-    o1, o2 = st.columns([4, 1])
-    with o1:
-        pick = st.selectbox("Άνοιγμα κωδικού", ["—"] + opts, key="live_pick",
-                            format_func=lambda c: labels.get(c, c))
-    with o2:
-        st.write("")
-        if st.button("📂 Άνοιγμα", use_container_width=True, disabled=pick == "—"):
-            _close_open_code(warehouse)
-            st.session_state.live_open = {"wh": warehouse, "loc": location, "code": pick,
-                                          "name": name, "locked": False, "lock_checked": False}
-            st.rerun()
+    with st.expander("ή άνοιγμα από λίστα"):
+        o1, o2 = st.columns([4, 1])
+        with o1:
+            pick = st.selectbox("Άνοιγμα κωδικού", ["—"] + opts, key="live_pick",
+                                format_func=lambda c: labels.get(c, c))
+        with o2:
+            st.write("")
+            if st.button("📂 Άνοιγμα", use_container_width=True, disabled=pick == "—"):
+                _open_live_code(warehouse, location, pick, name)
+
+
+def _table_click(prefix, codes_now):
+    """Επιστρέφει (κωδικός που πατήθηκε ή None, key για τον πίνακα που θα σχεδιαστεί τώρα).
+    Το key περιέχει «αποτύπωμα» της λίστας: αν η λίστα αλλάξει (ανανέωση 25''), ο πίνακας παίρνει
+    ΝΕΟ key, και ένα κλικ στον παλιό αντιστοιχίζεται με τη ΔΙΚΗ ΤΟΥ (παλιά) λίστα -> ποτέ λάθος κωδικός."""
+    n = st.session_state.get(prefix + "_n", 0)
+    sig = hashlib.sha1("\x1f".join(codes_now).encode("utf-8")).hexdigest()[:10]
+    key = f"{prefix}_{n}_{sig}"
+    store = st.session_state.setdefault(prefix + "_codes", {})
+    for k, codes in list(store.items()):
+        c = _clicked_row(k, codes)
+        if c:
+            st.session_state[prefix + "_n"] = n + 1          # νέος πίνακας = καθαρή επιλογή
+            st.session_state[prefix + "_codes"] = {}
+            return c, key
+    store[key] = list(codes_now)
+    while len(store) > 6:                                    # κρατάμε μόνο τις τελευταίες λίστες
+        store.pop(next(iter(store)))
+    return None, key
+
+
+def _clicked_row(tbl_key, codes):
+    """Ποια γραμμή πατήθηκε (κλικ σε κελί ή στη γραμμή). None αν τίποτα."""
+    try:
+        state = st.session_state.get(tbl_key)
+        if not state or not codes:
+            return None
+        sel = state["selection"] if isinstance(state, dict) else state.selection
+        rows = list(sel.get("rows") or [])
+        cells = list(sel.get("cells") or [])
+        idx = rows[0] if rows else (cells[0][0] if cells else None)
+        if idx is not None and 0 <= int(idx) < len(codes):
+            return codes[int(idx)]
+    except Exception:
+        return None
+    return None
+
+
+def _open_live_code(warehouse, location, code, name):
+    oc = st.session_state.get("live_open")
+    if oc and oc.get("wh") == warehouse and oc.get("loc") == location and oc.get("code") == code:
+        st.rerun()                     # είναι ήδη ανοιχτός -> τίποτα (να μην ξαναγραφτούν σχόλια)
+    if oc and oc.get("failed_sig"):
+        st.session_state["live_switch_block"] = (
+            f"⚠️ Στον κωδικό {oc.get('code')} υπάρχει διόρθωση που ΔΕΝ αποθηκεύτηκε. "
+            "Πάτα πρώτα «🔄 Ξαναφόρτωσε» εκεί (ή ξαναγράψε τη σωστή ποσότητα) και μετά άνοιξε άλλον.")
+        st.rerun()
+    _close_open_code(warehouse)
+    st.session_state.live_open = {"wh": warehouse, "loc": location, "code": code,
+                                  "name": name, "locked": False, "lock_checked": False,
+                                  "nonce": uuid.uuid4().hex[:8]}
+    st.rerun()
+
+
+_SAVE_LOCK_GUARD = threading.Lock()
+
+
+def _save_lock():
+    """Ένα κλείδωμα ανά χρήστη (συνεδρία): το Streamlit μπορεί να τρέχει ΔΥΟ φορές ταυτόχρονα τη
+    σελίδα (νέο κλικ/Enter πριν τελειώσει το προηγούμενο). Οι αποθηκεύσεις γίνονται μία-μία."""
+    with _SAVE_LOCK_GUARD:
+        lk = st.session_state.get("_save_lock")
+        if lk is None:
+            lk = threading.Lock()
+            st.session_state["_save_lock"] = lk
+        return lk
+
+
+def pending_edits(records: list, known: dict, applied: dict) -> list:
+    """Τι ΔΕΝ έχει γραφτεί ακόμα από όσα έγραψε ο υπάλληλος στον πίνακα.
+    records: γραμμές πίνακα · known: {bin: σύνολο που ξέρουμε ότι είναι στη βάση}
+    applied: {bin: {"total", "com"}} = ό,τι έχουμε ήδη γράψει από αυτόν τον πίνακα.
+    Η «σωστή ποσότητα» είναι ΤΕΛΙΚΗ τιμή -> ίδια τιμή δεν ξαναγράφεται ποτέ."""
+    out = []
+    for r in records:
+        b = r.get("BIN")
+        if b not in known:
+            continue
+        want = r.get("ΣΩΣΤΗ ΠΟΣΟΤΗΤΑ")
+        try:
+            want = None if want is None or pd.isna(want) else float(want)
+        except (TypeError, ValueError):
+            want = None
+        com = str(r.get("ΣΧΟΛΙΟ") or "").strip()
+        if com.lower() in ("nan", "none"):
+            com = ""
+        prev = applied.get(b) or {}
+        tot_changed = (want is not None and want != prev.get("total")
+                       and abs(want - float(known[b])) > 1e-9)
+        com_changed = bool(com) and com != prev.get("com", "")
+        if tot_changed or com_changed:
+            out.append({"bin": b, "loaded_total": float(known[b]),
+                        "new_total": want if tot_changed else None,
+                        "comment": com if com_changed else "", "_want": want, "_com": com})
+    return out
+
+
+def _apply_edits(oc, edits, warehouse, location, code, name, known, applied) -> str:
+    """Γράφει τις εκκρεμείς διορθώσεις. ΚΑΜΙΑ κλήση st.* εδώ (τρέχει μέσα στο κλείδωμα).
+    Επιστρέφει 'none' | 'saved' | 'blocked'. Μηνύματα -> session_state (flash)."""
+    if not edits:
+        return "none"
+    sig = repr([(e["bin"], e["new_total"], e["comment"]) for e in edits])
+    if oc.get("failed_sig") == sig:
+        return "blocked"
+
+    def _fmt_done(done):
+        return ", ".join(f"{b}: {'+' if q > 0 else ''}{fmt_num(q)}" if q else f"{b}: σχόλιο"
+                         for b, q in done)
+    done, partial = None, None
+    try:
+        done = save_bin_corrections(warehouse, location, code, name, edits)
+    except PartialSave as pe:
+        partial = pe
+    except Exception as e:
+        # Ο έλεγχος πριν γράψει απέτυχε -> ΔΕΝ γράφτηκε τίποτα. Να μην ξαναδοκιμάζει σε κάθε ανανέωση.
+        oc["failed_sig"] = sig
+        oc["failed_msg"] = f"Δεν αποθηκεύτηκε: {e}"
+        return "blocked"
+    saved_bins = {b for b, _q in (done if partial is None else partial.done)}
+    for e in edits:
+        if e["bin"] in saved_bins:
+            if e["new_total"] is not None:
+                known[e["bin"]] = float(e["new_total"])
+            applied[e["bin"]] = {"total": e["_want"], "com": e["_com"]}
+    oc.pop("failed_sig", None)
+    try:
+        d, _m = refresh_index_numbers(warehouse, location, code)
+        d_txt = f" Νέα διαφορά {location}: {fmt_num(d)}"
+    except Exception:
+        d_txt = " (η λίστα θα ενημερωθεί σε λίγο)"
+    try:
+        load_diff_rows.clear()
+    except Exception:
+        pass
+    if partial is None:
+        st.session_state["live_flash"] = f"✅ Αποθηκεύτηκε ({_fmt_done(done)}).{d_txt}"
+    else:
+        ok = _fmt_done(partial.done)
+        # Ό,τι έμεινε ανολοκλήρωτο: φρέσκο ξεκίνημα από τη βάση για να μη γραφτεί λάθος διαφορά.
+        oc["ver"] = oc.get("ver", 0) + 1
+        for k_ in ("product", "known", "applied"):
+            oc.pop(k_, None)
+        st.session_state["live_err_flash"] = {"code": code, "msg": (
+            f"⚠️ Η αποθήκευση σταμάτησε στο bin «{partial.failed_bin}» ({partial}). "
+            + (f"Αποθηκεύτηκαν: {ok}. " if ok else "")
+            + "Ο πίνακας ξαναφορτώθηκε από τη βάση — δες τα νούμερα (και το «Ιστορικό μετρήσεων» "
+              f"του «{partial.failed_bin}») πριν ξαναγράψεις ό,τι λείπει.")}
+    return "saved"
 
 
 def _live_detail(warehouse, location, name, can_edit):
@@ -1336,7 +2076,14 @@ def _live_detail(warehouse, location, name, can_edit):
 
     # Κλείδωμα (κίτρινο) — μία φορά με το άνοιγμα, με τους κανόνες της εφαρμογής.
     if can_edit and not oc.get("lock_checked"):
-        state, other = acquire_web_lock(warehouse, location, code, name, force=oc.get("force", False))
+        try:
+            state, other = acquire_web_lock(warehouse, location, code, name, force=oc.get("force", False))
+        except Exception as e:
+            st.markdown(f"### {code}")
+            st.error(f"Δεν έγινε έλεγχος στη βάση ({e}). Δοκίμασε ξανά σε λίγο.")
+            if st.button("✖ Κλείσιμο", key="oc_close_err"):
+                _close_open_code(warehouse); st.rerun()
+            return
         oc["lock_checked"] = True
         oc["lock_state"], oc["lock_other"] = state, other
         oc["locked"] = state == "locked"
@@ -1363,9 +2110,18 @@ def _live_detail(warehouse, location, name, can_edit):
     # Στιγμιότυπο: ό,τι βλέπει ο υπάλληλος μένει σταθερό μέχρι «Ξαναφόρτωσε»/«Αποθήκευση»,
     # ώστε ο έλεγχος «άλλαξε στο μεταξύ;» να συγκρίνει με αυτό που είδε.
     if "product" not in oc:
-        oc["product"] = read_product(warehouse, code)
+        try:
+            oc["product"] = read_product(warehouse, code)
+        except Exception as e:
+            st.error(f"Δεν διαβάστηκε ο κωδικός ({e}). Πάτα ξανά πάνω του σε λίγο.")
+            return
         oc["loaded"] = now_local().strftime("%H:%M:%S")
+        _b = (((oc["product"].get("locations") or {}).get(location) or {}).get("bins") or {})
+        oc["known"] = {bn: float(bb.get("συνολική_μέτρηση", 0) or 0) for bn, bb in _b.items()
+                       if isinstance(bb, dict)}
+        oc["applied"] = {}
     product = oc["product"]
+    known, applied = oc.setdefault("known", {}), oc.setdefault("applied", {})
     st.caption(f"{product.get('ΠΕΡΙΓΡΑΦΗ', '')} · φορτώθηκε {oc['loaded']}"
                + (" · 🟨 οι άλλοι βλέπουν ότι το ελέγχεις" if oc.get("locked") else ""))
 
@@ -1388,16 +2144,22 @@ def _live_detail(warehouse, location, name, can_edit):
                          "ΑΝΑΜΕΝΟΜΕΝΟ": float(b.get("αρχικό_απόθεμα", 0) or 0),
                          "ΜΕΤΡΗΘΗΚΕ": float(b.get("συνολική_μέτρηση", 0) or 0),
                          "ΣΩΣΤΗ ΠΟΣΟΤΗΤΑ": None, "ΣΧΟΛΙΟ": ""})
-    ti, tm = location_totals(product, location)
+    ti, _tm0 = location_totals(product, location)
+    tm = sum(known.values())          # μαζί με ό,τι αποθήκευσες από εδώ
     st.write(f"Σύνολο {location}: αναμενόμενο **{fmt_num(ti)}** · μετρήθηκε **{fmt_num(tm)}** · "
              f"διαφορά **{fmt_num(tm - ti)}**")
 
     edited = None
     if rows:
         ver = oc.get("ver", 0)
+        if can_edit:
+            st.markdown("✍️ Γράψε τη **σωστή ποσότητα** στο bin και πάτα **Enter** — "
+                        "αποθηκεύεται αμέσως. Λάθος; Ξαναγράψε τη σωστή και Enter.")
+        # Ο πίνακας μένει ΣΤΑΘΕΡΟΣ όσο είναι ανοιχτός ο κωδικός (ίδια δεδομένα + ίδιο key), ώστε
+        # ό,τι γραφτεί — ακόμα και όσο τρέχει μια αποθήκευση — να μη χάνεται ποτέ.
         edited = st.data_editor(
             pd.DataFrame(rows), hide_index=True, use_container_width=True,
-            key=f"ed_{warehouse}_{location}_{code}_{ver}",
+            key=f"ed_{warehouse}_{location}_{code}_{oc.get('nonce', '')}_{ver}",
             disabled=["BIN", "ΡΑΦΙ", "ΑΝΑΜΕΝΟΜΕΝΟ", "ΜΕΤΡΗΘΗΚΕ"] + ([] if can_edit else ["ΣΩΣΤΗ ΠΟΣΟΤΗΤΑ", "ΣΧΟΛΙΟ"]),
             column_config={
                 "ΣΩΣΤΗ ΠΟΣΟΤΗΤΑ": st.column_config.NumberColumn(
@@ -1420,10 +2182,45 @@ def _live_detail(warehouse, location, name, can_edit):
     flash = st.session_state.pop("live_flash", None)
     if flash:
         st.success(flash)
+    err_flash = st.session_state.pop("live_err_flash", None)
+    if isinstance(err_flash, dict) and err_flash.get("code") == code:
+        st.error(err_flash.get("msg"))
+    if applied:
+        st.caption("💾 Αποθηκευμένα από εδώ: " + " · ".join(
+            f"{b} → {fmt_num(known[b])}" + (" (σχόλιο)" if a.get("com") else "")
+            for b, a in applied.items() if b in known))
 
-    a1, a2, a3, a4 = st.columns(4)
-    with a1:
-        save = st.button("💾 Αποθήκευση", type="primary", use_container_width=True, disabled=not can_edit)
+    # Αυτόματη αποθήκευση: μόλις ολοκληρωθεί ένα κελί (Enter / κλικ αλλού) γράφεται ό,τι δεν έχει γραφτεί.
+    save_blocked = False
+    just_saved = False
+    if can_edit and edited is not None:
+        records = edited.to_dict("records")
+        run_ver = oc.get("ver", 0)
+        lock = _save_lock()
+        if not lock.acquire(timeout=60):
+            st.warning("⏳ Τρέχει ακόμα προηγούμενη αποθήκευση — περίμενε λίγο.")
+            save_blocked = True
+            edits = []
+        else:
+            outcome = "none"
+            try:
+                # Υπολογίζουμε ΜΕΣΑ στο κλείδωμα: ό,τι έσωσε ήδη άλλο τρέξιμο φαίνεται εδώ.
+                if st.session_state.get("live_open") is not oc or oc.get("ver", 0) != run_ver:
+                    outcome = "stale"     # άλλο τρέξιμο έκλεισε/ξαναφόρτωσε τον κωδικό -> τίποτα εδώ
+                else:
+                    edits = pending_edits(records, known, applied)
+                    outcome = _apply_edits(oc, edits, warehouse, location, code, name, known, applied)
+            finally:
+                lock.release()
+            if outcome == "stale":
+                st.rerun()                # δείξε την πραγματική κατάσταση· ΚΑΝΕΝΑ ✓/κλείσιμο από αυτό το κλικ
+            elif outcome == "blocked":
+                st.error(oc.get("failed_msg", "Δεν αποθηκεύτηκε."))
+                save_blocked = True
+            elif outcome == "saved":
+                just_saved = True         # τα κουμπιά (✓, Κλείσιμο) αυτού του κλικ ισχύουν κανονικά
+
+    a2, a3, a4 = st.columns(3)
     with a2:
         cur_row = (load_diff_rows(warehouse, location) or {}).get(code) or {}
         already = row_status(cur_row) in ("checked", "verified")
@@ -1434,24 +2231,10 @@ def _live_detail(warehouse, location, name, can_edit):
     with a4:
         close = st.button("✖ Κλείσιμο", use_container_width=True)
 
-    if save and edited is not None:
-        edits = edits_from_editor(edited.to_dict("records"))
-        if not edits:
-            st.warning("Δεν άλλαξε τίποτα — γράψε σωστή ποσότητα ή σχόλιο σε κάποιο bin.")
-        else:
-            try:
-                done = save_bin_corrections(warehouse, location, code, name, edits)
-                d, m = refresh_index_numbers(warehouse, location, code)
-                load_diff_rows.clear()
-                oc["ver"] = oc.get("ver", 0) + 1
-                oc.pop("product", None)   # ξαναδιάβασμα στο επόμενο render
-                parts = [f"{b}: {'+' if q > 0 else ''}{fmt_num(q)}" if q else f"{b}: σχόλιο" for b, q in done]
-                st.session_state.live_flash = (f"Αποθηκεύτηκε ({', '.join(parts)}). "
-                                               f"Νέα διαφορά {location}: {fmt_num(d)}")
-                st.rerun()
-            except Exception as e:
-                st.error(f"Δεν αποθηκεύτηκε: {e}")
-
+    if save_blocked and (chk or close):
+        st.error("⚠️ Η διόρθωση που έγραψες ΔΕΝ αποθηκεύτηκε, γι' αυτό ο κωδικός δεν σημειώθηκε/δεν έκλεισε. "
+                 "Πάτα «🔄 Ξαναφόρτωσε», δες τα νέα νούμερα και ξαναγράψε τη σωστή ποσότητα.")
+        chk = close = False
     if chk:
         try:
             product = read_product(warehouse, code)
@@ -1465,10 +2248,13 @@ def _live_detail(warehouse, location, name, can_edit):
             st.error(f"Αποτυχία: {e}")
     if reload_:
         oc["ver"] = oc.get("ver", 0) + 1
-        oc.pop("product", None)
+        for k_ in ("product", "known", "applied", "failed_sig"):
+            oc.pop(k_, None)
         st.rerun()
     if close:
         _close_open_code(warehouse)
+        st.rerun()
+    if just_saved:
         st.rerun()
 
 
@@ -1577,7 +2363,7 @@ def _do_export(fn, filename):
 
 
 def main():
-    st.set_page_config(page_title="Απογραφή", page_icon="📦")
+    st.set_page_config(page_title="Απογραφή", page_icon="📦", layout="wide")
     if "role" not in st.session_state:
         login_view()
     else:
