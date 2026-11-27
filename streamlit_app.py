@@ -1476,6 +1476,74 @@ def mark_case_found_web(warehouse, serial, name, location, position, comment="")
     return _case_tx(warehouse, serial, ch)
 
 
+def apply_case_changes(warehouse, serial, name, note="", found=None, exclude=None, reason="") -> dict:
+    """ΜΙΑ αποθήκευση από το παράθυρο κιβωτίου, όλα μαζί ατομικά (ή όλα ή τίποτα).
+    note: κείμενο σημείωσης ("" = καμία) · found: (τοποθεσία, θέση, σχόλιο) ή None
+    exclude: True/False για «δεν μετράμε»/«μετράμε», None = καμία αλλαγή.
+    Επιστρέφει {"note","found","excl"} με 'ok' | 'already' (ήδη έτσι) ή {} αν δεν άλλαξε τίποτα."""
+    note = (note or "").strip()
+    reason = (reason or "").strip()
+    if found is not None:
+        loc, pos, com = found
+        pos = (pos or "").strip()
+        if not pos:
+            raise ValueError("Για «Βρέθηκε» γράψε τη θέση (όπως ζητά και η εφαρμογή).")
+        t = now_local()
+        m_key = f"{name}_{t.strftime('%d-%H:%M:%S')}-web{t.microsecond // 1000:03d}{uuid.uuid4().hex[:4]}"
+        meas = {"user": name, "timestamp": t.strftime("%d-%H:%M:%S"), "location": loc,
+                "position": pos, "σχόλιο": (com or "").strip() or "από γραφείο"}
+    entries = []
+    if exclude is not None:
+        entries.append(("excl", _note_entry(name, ("🚫 Δεν μετράμε" + (f": {reason}" if reason else ""))
+                                            if exclude else "↩️ Μετράμε ξανά")))
+    if note:
+        entries.append(("note", _note_entry(name, note)))
+    out = {}
+
+    def ch(c):
+        out.clear()
+        changed = False
+        notes = c.get("σημειώσεις")
+        notes = dict(notes) if isinstance(notes, dict) else _as_dict(notes)
+        if exclude is not None:
+            if exclude == isinstance(c.get("εξαίρεση"), dict):
+                out["excl"] = "already"
+            else:
+                if exclude:
+                    c["εξαίρεση"] = {"by": name, "at": now_ms(), "λόγος": reason}
+                else:
+                    c.pop("εξαίρεση", None)
+                k_, n_ = dict(entries)["excl"]
+                notes[k_] = n_
+                out["excl"] = "ok"
+                changed = True
+        if found is not None:
+            raw = c.get("κατάσταση")
+            if ("ΟΧΙ" if raw is None else str(raw)).strip() != "ΟΧΙ":
+                out["found"] = "already"      # το βρήκε ήδη κάποιος (π.χ. από την εφαρμογή)
+            else:
+                ms = c.get("μετρήσεις")
+                c["μετρήσεις"] = dict(ms) if isinstance(ms, dict) else _as_dict(ms)
+                c["μετρήσεις"][m_key] = meas
+                c["κατάσταση"] = "Βρέθηκε"
+                c["Θέση"] = pos
+                out["found"] = "ok"
+                changed = True
+        if note:
+            k_, n_ = dict(entries)["note"]
+            notes[k_] = n_
+            out["note"] = "ok"
+            changed = True
+        if notes:
+            c["σημειώσεις"] = notes
+        return "ok" if changed else "already"
+
+    r = _case_tx(warehouse, serial, ch)
+    if r == "missing":
+        raise RuntimeError(f"Το κιβώτιο {serial} δεν υπάρχει πια στη βάση (ίσως ξαναφορτώθηκε η αποθήκη).")
+    return dict(out)
+
+
 @st.cache_data(ttl=LIVE_REFRESH_SEC - 5, show_spinner=False)
 def load_cases(warehouse: str) -> dict:
     """ΚΟΙΝΗ cache για όλους: η αποθήκη διαβάζεται το πολύ μία φορά ανά ~20''."""
@@ -1563,130 +1631,133 @@ def filter_case_rows(rows, cats, only_other_loc=False, locs=None, search="", hid
 
 def cases_view(warehouse: str, role: str = "USER"):
     can_edit = role == "ADMIN" or bool(user_password())
-    st.caption("Τα φίλτρα είναι για τον καθένα ξεχωριστά. Σημειώσεις / «Βρέθηκε» / «Δεν μετράμε» "
-               "γράφονται στη βάση, τα βλέπουν όλοι και βγαίνουν στο export.")
+    st.caption("Κάνε κλικ σε ένα κιβώτιο: ανοίγει παράθυρο για σημείωση / «Βρέθηκε» / «Δεν μετράμε» "
+               "και μία «💾 Αποθήκευση». Οι αλλαγές τις βλέπουν όλοι και βγαίνουν στο export.")
     fl = st.session_state.pop("cases_flash", None)
     if fl:
         st.success(fl)
+    name = None
     if can_edit:
-        with st.expander("✏️ Σημείωση / αλλαγή σε κιβώτιο",
-                         expanded=bool(st.session_state.get("cases_pick"))
-                         or st.session_state.get(f"ca_{warehouse}_case", "—") != "—"):
+        names = team_names()
+        cur_name = st.session_state.get("live_name")
+        k = f"ca_{warehouse}_"
+        c1, c2 = st.columns([1, 3])
+        with c1:
+            sel = st.selectbox("Ποιος είσαι;", ["—"] + names,
+                               index=(names.index(cur_name) + 1) if cur_name in names else 0, key=k + "name")
+            if sel != "—":
+                st.session_state.live_name = sel
+                name = sel
+        with c2:
             try:
-                _case_actions(warehouse)
-            except Exception as e:
-                st.warning(f"Δεν φορτώθηκαν τα κιβώτια ({e}). Δοκίμασε ξανά σε λίγο.")
+                all_cases = sorted(load_cases(warehouse))
+            except Exception:
+                all_cases = []
+            sn = st.session_state.get(k + "search_n", 0)
+            srch = st.selectbox("ή άνοιξε κιβώτιο με αναζήτηση (γράψε τον αριθμό)", ["—"] + all_cases,
+                                key=f"{k}search_{sn}")
+            if srch != "—":
+                st.session_state[k + "search_n"] = sn + 1     # την επόμενη φορά ξανά «—»
+                st.session_state.cases_pick = srch
+        pick = st.session_state.pop("cases_pick", None)
+        if pick:
+            if name:
+                _case_dialog(warehouse, pick, name)
+            else:
+                st.warning("Διάλεξε πρώτα το όνομά σου («Ποιος είσαι;») και ξαναπάτα το κιβώτιο.")
     else:
+        st.session_state.pop("cases_pick", None)
         st.info("Προβολή μόνο: για σημειώσεις/αλλαγές χρειάζεται κωδικός USER στα Secrets.")
     _cases_live(warehouse)
 
 
-def _case_actions(warehouse: str):
-    k = f"ca_{warehouse}_"
-    data = load_cases(warehouse)
-    pick = st.session_state.pop("cases_pick", None)
-    if pick and pick in _as_dict(data):
-        st.session_state[k + "case"] = pick       # πριν σχεδιαστεί το selectbox (επιτρέπεται)
-    names = team_names()
-    cur_name = st.session_state.get("live_name")
-    c1, c2 = st.columns([1, 3])
-    with c1:
-        name = st.selectbox("Ποιος είσαι;", ["—"] + names,
-                            index=(names.index(cur_name) + 1) if cur_name in names else 0, key=k + "name")
-        if name != "—":
-            st.session_state.live_name = name
-    rows = {r["CASE"]: r for r in case_rows(data)}
-    with c2:
-        serial = st.selectbox("Κιβώτιο (γράψε για αναζήτηση)", ["—"] + list(rows),
-                              format_func=lambda s: s if s == "—" or s not in rows else
-                              f"{s} — {rows[s]['ΠΕΡΙΓΡΑΦΗ']} — {rows[s]['ΚΑΤΗΓΟΡΙΑ']}"
-                              + (" — 🚫" if rows[s]["_excl"] else ""),
-                              key=k + "case")
-    if name == "—":
-        st.info("Διάλεξε πρώτα το όνομά σου — μπαίνει σε κάθε σημείωση/αλλαγή.")
-        return
-    if serial == "—" or serial not in rows:
-        return
+@st.dialog("📦 Κιβώτιο", width="large")
+def _case_dialog(warehouse: str, serial: str, name: str):
     try:
-        fresh = _case_ref(warehouse, serial).get()      # ζωντανά από τη βάση, όχι από την cache
-    except Exception:
-        fresh = data.get(serial)
-    if not isinstance(fresh, dict):
+        c = _case_ref(warehouse, serial).get()          # ζωντανά από τη βάση τη στιγμή που ανοίγει
+    except Exception as e:
+        st.error(f"Δεν διαβάστηκε το κιβώτιο ({e}). Κλείσε και ξαναδοκίμασε.")
+        return
+    if not isinstance(c, dict):
         st.warning(f"Το κιβώτιο {serial} δεν υπάρχει πια στη βάση (ίσως ξαναφορτώθηκε η αποθήκη).")
         return
-    c = fresh
     r = case_rows({serial: c})[0]
-    st.markdown(f"**{serial}** · {r['ΠΕΡΙΓΡΑΦΗ']} · {r['ΔΙΑΣΤΑΣΗ']} · {r['ΚΑΤΗΓΟΡΙΑ']}"
-                + (f" · θέση **{r['ΘΕΣΗ']}**" if r["ΘΕΣΗ"] else "")
-                + (f" · αναμ. τοποθεσία {r['ΑΝΑΜ. ΤΟΠΟΘΕΣΙΑ']}" if r["ΑΝΑΜ. ΤΟΠΟΘΕΣΙΑ"] else ""))
+    st.markdown(f"### {serial}")
+    st.markdown(f"**{r['ΠΕΡΙΓΡΑΦΗ'] or '—'}** · {r['ΔΙΑΣΤΑΣΗ'] or '—'}")
+    info = [f"Κατάσταση: **{r['ΚΑΤΗΓΟΡΙΑ']}**"]
+    if r["ΑΝΑΜ. ΤΟΠΟΘΕΣΙΑ"]:
+        info.append(f"αναμενόμενη τοποθεσία **{r['ΑΝΑΜ. ΤΟΠΟΘΕΣΙΑ']}**")
+    if r["ΒΡΕΘΗΚΕ ΣΕ"]:
+        info.append(f"βρέθηκε σε **{r['ΒΡΕΘΗΚΕ ΣΕ']}**")
+    if r["ΘΕΣΗ"]:
+        info.append(f"θέση **{r['ΘΕΣΗ']}**")
+    if r["ΑΠΟ"]:
+        info.append(f"από {r['ΑΠΟ']} ({r['ΩΡΑ']})")
+    if r["ΦΥΛΛΑ"]:
+        info.append(f"φύλλα {r['ΦΥΛΛΑ']}")
+    st.markdown(" · ".join(info))
+    if r["_excl"]:
+        st.info(f"🚫 Δεν μετράμε — {r['ΔΕΝ ΜΕΤΡΑΜΕ'].replace('🚫 ', '', 1)}")
     notes = _case_notes(c)
     if notes:
         st.dataframe(pd.DataFrame([{"ΑΠΟ": _txt(n.get("user")), "ΩΡΑ": _txt(n.get("timestamp")),
                                     "ΣΗΜΕΙΩΣΗ": _txt(n.get("κείμενο"))} for n in notes]),
                      hide_index=True, use_container_width=True)
 
-    def done(msg):
-        load_cases.clear()
-        st.session_state.cases_flash = msg
-        st.rerun()
-
-    a1, a2, a3 = st.columns(3)
-    with a1:
-        with st.form(k + "note_f", clear_on_submit=True):
-            txt = st.text_area("📝 Νέα σημείωση", height=80)
-            if st.form_submit_button("Προσθήκη σημείωσης", use_container_width=True):
-                try:
-                    add_case_note(warehouse, serial, name, txt)
-                except Exception as e:
-                    st.error(f"Δεν αποθηκεύτηκε: {e}")
-                else:
-                    done(f"📝 Σημείωση στο {serial} αποθηκεύτηκε.")
-    with a2:
+    with st.form(f"case_dlg_{serial}"):
+        note = st.text_area("📝 Σημείωση (προαιρετικό)", height=80)
+        found = None
         if r["_cat"] == "missing":
-            with st.form(k + "found_f", clear_on_submit=True):
-                st.markdown("✅ **Βρέθηκε** (όπως το σκανάρισμα)")
+            f1, f2, f3 = st.columns([1, 1, 2])
+            with f1:
+                is_found = st.checkbox("✅ Βρέθηκε")
+            with f2:
                 exp = r["ΑΝΑΜ. ΤΟΠΟΘΕΣΙΑ"]
                 loc = st.selectbox("Τοποθεσία", LOCATIONS,
                                    index=LOCATIONS.index(exp) if exp in LOCATIONS else 0)
-                pos = st.text_input("Θέση (υποχρεωτικό)")
-                com = st.text_input("Σχόλιο (προαιρετικό)")
-                if st.form_submit_button("✅ Σήμανση «Βρέθηκε»", use_container_width=True):
-                    res = None
-                    try:
-                        res = mark_case_found_web(warehouse, serial, name, loc, pos, com)
-                    except Exception as e:
-                        st.error(f"Δεν αποθηκεύτηκε: {e}")
-                    if res == "found":
-                        done(f"✅ {serial}: Βρέθηκε (θέση {pos.strip()}).")
-                    elif res == "already":
-                        load_cases.clear()
-                        st.warning("Το κιβώτιο έχει ΗΔΗ βρεθεί (μάλλον μόλις από την εφαρμογή). Δεν άλλαξε τίποτα.")
-                    elif res == "missing":
-                        st.error("Το κιβώτιο δεν υπάρχει πια στη βάση.")
-        else:
-            st.caption("✅ «Βρέθηκε» γίνεται μόνο σε κιβώτια που δεν έχουν βρεθεί.")
-    with a3:
-        with st.form(k + "excl_f", clear_on_submit=True):
-            if r["_excl"]:
-                st.markdown(f"🚫 **Δεν μετράμε** — {r['ΔΕΝ ΜΕΤΡΑΜΕ'].replace('🚫 ', '', 1)}")
-                if st.form_submit_button("↩️ Μετράμε ξανά", use_container_width=True):
-                    try:
-                        rr = set_case_exclusion(warehouse, serial, name, False)
-                    except Exception as e:
-                        st.error(f"Δεν αποθηκεύτηκε: {e}")
-                    else:
-                        done(f"↩️ {serial}: μετράμε ξανά." if rr != "already"
-                             else f"{serial}: ήταν ήδη «μετράμε» — καμία αλλαγή.")
-            else:
-                reason = st.text_input("🚫 Δεν μετράμε — λόγος")
-                if st.form_submit_button("🚫 Δεν το μετράμε", use_container_width=True):
-                    try:
-                        rr = set_case_exclusion(warehouse, serial, name, True, reason)
-                    except Exception as e:
-                        st.error(f"Δεν αποθηκεύτηκε: {e}")
-                    else:
-                        done(f"🚫 {serial}: δεν μετράμε." if rr != "already"
-                             else f"{serial}: ήταν ήδη «δεν μετράμε» (από άλλον) — καμία αλλαγή.")
+            with f3:
+                pos = st.text_input("Θέση (υποχρεωτικό αν βρέθηκε)")
+        excl_now = r["_excl"]
+        e1, e2 = st.columns([1, 2])
+        with e1:
+            excl = st.checkbox("🚫 Δεν το μετράμε", value=excl_now)
+        with e2:
+            reason = st.text_input("Λόγος (αν δεν το μετράμε)",
+                                   value="" if not excl_now else "", disabled=False)
+        b1, b2 = st.columns(2)
+        save = b1.form_submit_button("💾 Αποθήκευση", type="primary", use_container_width=True)
+        cancel = b2.form_submit_button("✖ Κλείσιμο", use_container_width=True)
+    if cancel:
+        st.rerun()
+    if save:
+        if r["_cat"] == "missing" and is_found:
+            found = (loc, pos, "")
+        exclude = None if excl == excl_now else excl
+        try:
+            res = apply_case_changes(warehouse, serial, name, note, found, exclude, reason)
+        except Exception as e:
+            st.error(f"Δεν αποθηκεύτηκε: {e}")
+            return
+        if not res or all(v == "already" for v in res.values()):
+            msgs = []
+            if res.get("found") == "already":
+                msgs.append("το κιβώτιο έχει ΗΔΗ βρεθεί (μάλλον μόλις από την εφαρμογή)")
+            if res.get("excl") == "already":
+                msgs.append("το «δεν μετράμε» ήταν ήδη έτσι")
+            st.warning("Δεν άλλαξε τίποτα" + (": " + "· ".join(msgs) if msgs else " — γράψε σημείωση ή άλλαξε κάτι."))
+            return
+        done = []
+        if res.get("found") == "ok":
+            done.append(f"✅ βρέθηκε (θέση {pos.strip()})")
+        elif res.get("found") == "already":
+            done.append("⚠️ είχε ήδη βρεθεί από άλλον — δεν άλλαξε")
+        if res.get("excl") == "ok":
+            done.append("🚫 δεν μετράμε" if exclude else "↩️ μετράμε ξανά")
+        if res.get("note") == "ok":
+            done.append("📝 σημείωση")
+        load_cases.clear()
+        st.session_state.cases_flash = f"💾 {serial}: " + " · ".join(done)
+        st.rerun()
 
 
 @st.fragment(run_every=LIVE_REFRESH_SEC)
@@ -1752,7 +1823,7 @@ def _cases_live(warehouse: str):
     if clicked:
         st.session_state.cases_pick = clicked
         st.rerun()
-    st.caption("👆 Κάνε κλικ σε ένα κιβώτιο για σημείωση / αλλαγή (ανοίγει από πάνω).")
+    st.caption("👆 Κάνε κλικ σε ένα κιβώτιο — ανοίγει παράθυρο για αλλαγές.")
     st.dataframe(styled, hide_index=True, use_container_width=True, height=680, key=tbl_key,
                  on_select="rerun", selection_mode=["single-row", "single-cell"])
     try:
